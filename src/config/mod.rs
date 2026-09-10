@@ -185,6 +185,11 @@ pub fn load_config(cli_path: Option<&Path>) -> (AppConfig, PathBuf) {
     // shouldn't be hijacked into the wizard. Detect by presence of any
     // non-default field that the user must have written deliberately.
     migrate_first_run_marker(&mut cfg, &path);
+    // Study Mode fork: autoplay is permanently disabled at the config choke
+    // point. Every downstream gate (lib.rs spawn, ipc hot-start,
+    // bot::manager per-response flush) reads this field, so forcing it here
+    // kills autoplay for the whole process regardless of what config.toml says.
+    cfg.autoplay.enabled = false;
     (cfg, path)
 }
 
@@ -228,6 +233,20 @@ mod tests {
         d.push(format!("akagi-cfg-{tag}-{pid}-{nanos}"));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Study Mode fork: even a config.toml that explicitly sets
+    /// `[autoplay] enabled = true` must load with autoplay off.
+    #[test]
+    fn autoplay_is_forced_off_on_load() {
+        let dir = temp_dir("autoplay-kill");
+        let target = dir.join("config.toml");
+        std::fs::write(&target, "[autoplay]\nenabled = true\n").unwrap();
+
+        let (cfg, _) = load_config(Some(&target));
+        assert!(!cfg.autoplay.enabled, "autoplay must be forced off");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

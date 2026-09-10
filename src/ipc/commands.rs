@@ -88,6 +88,9 @@ pub async fn update_config(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> CmdResult<()> {
+    // Study Mode fork: autoplay stays off no matter what the frontend sends.
+    let mut new_config = new_config;
+    new_config.autoplay.enabled = false;
     persist_config(&new_config, &state.config_path).map_err(|e| e.to_string())?;
 
     // Snapshot the *previous* capture-relevant fields before we overwrite,
