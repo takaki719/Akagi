@@ -1,0 +1,39 @@
+name: mortal_kosei bot (Windows)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Clone Mortal
+        run: git clone --depth 1 https://github.com/Equim-chan/Mortal.git
+
+      - name: Build libriichi (links against Python 3.12)
+        shell: bash
+        run: |
+          export PYO3_PYTHON="$(which python)"
+          cd Mortal
+          cargo build -p libriichi --lib --release
+
+      - name: Assemble bot folder (model .pth NOT included — add it after unzip)
+        shell: bash
+        run: |
+          mkdir -p out/mortal_kosei
+          cp mjai_bot/mortal_kosei/bot.py mjai_bot/mortal_kosei/test_bot.py \
+             mjai_bot/mortal_kosei/manifest.toml mjai_bot/mortal_kosei/pyproject.toml \
+             out/mortal_kosei/
+          cp Mortal/mortal/model.py Mortal/mortal/engine.py out/mortal_kosei/
+          cp Mortal/target/release/riichi.dll out/mortal_kosei/libriichi.pyd
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mortal_kosei-windows-x64
+          path: out/
