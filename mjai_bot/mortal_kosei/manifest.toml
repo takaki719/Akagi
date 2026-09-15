@@ -1,0 +1,9 @@
+manifest_version = 1
+
+[bot]
+name        = "mortal_kosei"
+display     = "Mortal (self-trained)"
+description = "Self-trained Mortal v4 (10.8M params, 2.43M houou games, 78.1% expert agreement). Local CPU inference, top-3 HUD."
+version     = "0.1.0"
+
+[settings]
