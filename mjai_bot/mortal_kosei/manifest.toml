@@ -3,7 +3,7 @@ manifest_version = 1
 [bot]
 name        = "mortal_kosei"
 display     = "Mortal (self-trained)"
-description = "Self-trained Mortal v4 (10.8M params, 2.43M houou games, 78.1% expert agreement). Local CPU inference, top-3 HUD."
+description = "Self-trained Mortal v4 (10.8M params, 2.43M houou games, 78.1% expert agreement). Local CPU inference, top-3 HUD. 4-player only — use the built-in 3p bot for sanma."
 version     = "0.1.0"
 
 [settings]

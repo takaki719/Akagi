@@ -74,10 +74,22 @@ def add_show_card(reaction):
     return reaction
 
 
+def notify_sanma_unsupported():
+    payload = {
+        'level': 'warn',
+        'title': '三人麻雀には非対応',
+        'body': 'Mortal (self-trained) は四人麻雀専用です。三麻では内蔵の Akagi (built-in, 3p) を有効にしてください。',
+        'sticky': True,
+        'id': 'mortal_kosei_sanma',
+    }
+    print('@@AKAGI_NOTIFY@@ ' + json.dumps(payload), file=sys.stderr, flush=True)
+
+
 def main():
     seat = resolve_seat()
     engine = build_engine()
     bot = None
+    sanma = False
 
     for line in sys.stdin:
         line = line.strip()
@@ -89,11 +101,20 @@ def main():
             reaction = None
             for event in events:
                 etype = event.get('type')
-                if etype == 'start_game':
-                    seat = event.get('id', seat)
-                    bot = Bot(engine, seat)
                 if etype == 'end_game':
                     saw_end_game = True
+                if etype == 'start_game':
+                    seat = event.get('id', seat)
+                    # libriichi (Mortal) is 4-player only: a sanma stream would
+                    # fault on every event and leave the HUD silently empty.
+                    sanma = event.get('num_players', len(event.get('names', []))) == 3
+                    if sanma:
+                        notify_sanma_unsupported()
+                        bot = None
+                        continue
+                    bot = Bot(engine, seat)
+                if sanma:
+                    continue
                 if bot is None:
                     continue
                 r = bot.react(json.dumps(event))
