@@ -276,6 +276,26 @@ pub fn decode_action(name: &str, b64: &str) -> Result<JsonValue> {
     decode_named_action(name, &bytes)
 }
 
+/// Decode a base64 `{string name; bytes data}` `Wrapper` blob and resolve
+/// `data` via the message descriptor named by `name` — same name-resolution
+/// as [`decode_named_action`], but **no XOR** (paipu / `GameDetailRecords`
+/// bytes are never obfuscated, only the live `.lq.ActionPrototype` notify
+/// is). Returns the wrapper's `name` alongside the decoded JSON.
+///
+/// One shared decode path for all three paipu wrapper occurrences: the
+/// outer `ResGameRecord.data` (→ `.lq.GameDetailRecords`), each
+/// `GameDetailRecords.records[i]` (legacy), and each
+/// `GameAction.result` (current `actions[]` shape) — all three are `bytes`
+/// fields that, once base64-decoded, are themselves an encoded `Wrapper`.
+pub fn decode_paipu_wrapper(b64: &str) -> Result<(String, JsonValue)> {
+    let bytes = BASE64
+        .decode(b64)
+        .context("base64 decode failed for paipu wrapper")?;
+    let wrapper = decode_wrapper(&bytes)?;
+    let json = decode_named_action(&wrapper.name, &wrapper.data)?;
+    Ok((wrapper.name, json))
+}
+
 /// Decode an action embedded in a `GameRestore` replay (the `game_restore`
 /// field of a `.lq.FastTest.syncGame` / `.lq.FastTest.enterGame` response).
 ///

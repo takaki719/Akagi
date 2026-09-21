@@ -48,6 +48,15 @@ const METHOD_INPUT_CHI_PENG_GANG: &str = ".lq.FastTest.inputChiPengGang";
 /// setting. Observed as exactly this value on both input methods.
 const TIMEUSE_CLIENT_AUTO: u64 = 1_000_000;
 const METHOD_ENTER_GAME: &str = ".lq.FastTest.enterGame";
+/// Login response carrying the user's own `account_id` — captured so a
+/// later `fetchGameRecord` can resolve which `head.accounts[]` entry (and
+/// therefore which seat) is the POV player's. See `handle_game_record`.
+const METHOD_OAUTH2_LOGIN: &str = ".lq.Lobby.oauth2Login";
+/// A past-game replay the user opened in the client (`牌譜`/paipu). Carries
+/// the full game record (`head` + base64 `data`/`.lq.GameDetailRecords`);
+/// converted to the same mjai stream a live game produces. See
+/// `handle_game_record`.
+const METHOD_FETCH_GAME_RECORD: &str = ".lq.Lobby.fetchGameRecord";
 const ACTION_NEW_ROUND: &str = "ActionNewRound";
 const ACTION_DEAL_TILE: &str = "ActionDealTile";
 const ACTION_DISCARD_TILE: &str = "ActionDiscardTile";
@@ -296,6 +305,30 @@ impl MajsoulBridge {
             (MessageType::Notify, METHOD_ACTION_PROTOTYPE) => self.handle_action_prototype(msg),
             (MessageType::Response, METHOD_SYNC_GAME)
             | (MessageType::Response, METHOD_ENTER_GAME) => self.handle_game_restore(&msg.payload),
+            (MessageType::Response, METHOD_OAUTH2_LOGIN) => {
+                // `account_id` is a non-optional uint32; `skip_default_fields(false)`
+                // means "not logged in yet" and "account_id 0" are indistinguishable
+                // from a bare 0, so treat 0 as absent rather than a real id.
+                let id = msg
+                    .payload
+                    .get("account_id")
+                    .and_then(JsonValue::as_u64)
+                    .filter(|&id| id != 0)
+                    .or_else(|| {
+                        msg.payload
+                            .pointer("/account/account_id")
+                            .and_then(JsonValue::as_u64)
+                            .filter(|&id| id != 0)
+                    });
+                if let Some(id) = id {
+                    info!(target: "akagi::bridge::majsoul", "oauth2Login resolved account_id={id}");
+                    self.account_id = Some(id);
+                }
+                Vec::new()
+            }
+            (MessageType::Response, METHOD_FETCH_GAME_RECORD) => {
+                self.handle_game_record(&msg.payload)
+            }
             (MessageType::Notify, METHOD_NOTIFY_GAME_END_RESULT) => {
                 info!(
                     target: "akagi::bridge::majsoul",
@@ -426,6 +459,261 @@ impl MajsoulBridge {
             b
         });
         self.store_budget(committed);
+        events
+    }
+
+    /// Convert a `.lq.Lobby.fetchGameRecord` response — a past-game replay
+    /// (paipu) the user opened in the client — into the same
+    /// `[start_game, ..., end_game]` mjai stream a live game produces, so
+    /// the History recorder saves it exactly like a live game. Passive: the
+    /// frame is one the client already fetched, nothing is requested here.
+    ///
+    /// Shape: `head` (`RecordGame`: `accounts`, `config`, `result`, `uuid`)
+    /// + `data`, a base64 `.lq.GameDetailRecords` wrapping one
+    /// `.lq.RecordXxx` per `GameAction.result` (current shape) or legacy
+    /// `records[]` entry. `data_url` is only ever populated when `data` is
+    /// empty (very large records get offloaded to a CDN URL); fetching it
+    /// would be a network request this bridge must never make, so that case
+    /// is logged and dropped rather than followed.
+    ///
+    /// A paipu is a neutral, full-information record — every seat's
+    /// starting hand and every draw. A live stream never is. Each decoded
+    /// `RecordXxx` is mapped to its `ActionXxx` counterpart and redacted to
+    /// `our_seat`'s point of view (see `record_to_action`) before being fed
+    /// through the normal `handle_action_prototype` path, exactly like
+    /// `handle_game_restore` does for a reconnect replay — including its
+    /// `replaying` guard, so a stray `operation` window in the replayed
+    /// data can never open a decision window on the shared autoplay budget
+    /// slot (a browsed replay is not a live decision to act on).
+    fn handle_game_record(&mut self, payload: &JsonValue) -> Vec<MjaiEvent> {
+        let Some(head) = payload.get("head").filter(|h| !h.is_null()) else {
+            warn!(
+                target: "akagi::bridge::majsoul",
+                "fetchGameRecord response missing head: {payload}"
+            );
+            return Vec::new();
+        };
+        let Some(uuid) = head.get("uuid").and_then(JsonValue::as_str) else {
+            warn!(
+                target: "akagi::bridge::majsoul",
+                "fetchGameRecord head missing uuid: {head}"
+            );
+            return Vec::new();
+        };
+
+        let data_b64 = payload
+            .get("data")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
+        if data_b64.is_empty() {
+            let data_url = payload
+                .get("data_url")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
+            if data_url.is_empty() {
+                warn!(
+                    target: "akagi::bridge::majsoul",
+                    "fetchGameRecord {uuid} has no data and no data_url; nothing to import"
+                );
+            } else {
+                warn!(
+                    target: "akagi::bridge::majsoul",
+                    "fetchGameRecord {uuid} data is empty and data_url is set ({data_url}); \
+                     fetching it would be a network request this bridge must not make — \
+                     dropping this replay"
+                );
+            }
+            return Vec::new();
+        }
+
+        let (wrapper_name, detail) = match parser::decode_paipu_wrapper(data_b64) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    target: "akagi::bridge::majsoul",
+                    "fetchGameRecord {uuid}: failed to decode data: {e:#}"
+                );
+                return Vec::new();
+            }
+        };
+        if wrapper_name != ".lq.GameDetailRecords" {
+            warn!(
+                target: "akagi::bridge::majsoul",
+                "fetchGameRecord {uuid}: expected .lq.GameDetailRecords, got {wrapper_name}; \
+                 attempting to continue"
+            );
+        }
+
+        // Current shape: `actions[]`, each a `GameAction` whose `result` is
+        // (when present — plenty of entries are non-record client events
+        // with an empty `result`) itself a base64 `{name, data}` wrapper.
+        // Legacy fallback: `records[]`, each entry *is* that wrapper
+        // directly. Prefer `actions` whenever the array itself is present,
+        // matching real traffic (v2 shape).
+        let record_blobs: Vec<&str> = if let Some(actions) = detail
+            .get("actions")
+            .and_then(JsonValue::as_array)
+            .filter(|a| !a.is_empty())
+        {
+            actions
+                .iter()
+                .filter_map(|a| a.get("result").and_then(JsonValue::as_str))
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            detail
+                .get("records")
+                .and_then(JsonValue::as_array)
+                .map(|records| {
+                    records
+                        .iter()
+                        .filter_map(JsonValue::as_str)
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        if record_blobs.is_empty() {
+            warn!(
+                target: "akagi::bridge::majsoul",
+                "fetchGameRecord {uuid} decoded but carries no records to replay"
+            );
+            return Vec::new();
+        }
+
+        let accounts = head
+            .get("accounts")
+            .and_then(JsonValue::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let robots = head
+            .get("robots")
+            .and_then(JsonValue::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let our_seat = self
+            .account_id
+            .and_then(|id| {
+                accounts
+                    .iter()
+                    .find(|a| a.get("account_id").and_then(JsonValue::as_u64) == Some(id))
+            })
+            .and_then(|a| a.get("seat").and_then(JsonValue::as_u64))
+            .map(|s| s as Actor)
+            .unwrap_or_else(|| {
+                warn!(
+                    target: "akagi::bridge::majsoul",
+                    "fetchGameRecord {uuid}: could not resolve our seat from account_id={:?} \
+                     against {} accounts; falling back to seat 0",
+                    self.account_id,
+                    accounts.len(),
+                );
+                0
+            });
+
+        let detected = (accounts.len() + robots.len()) as u8;
+        let num_players = if detected == 3 || detected == 4 {
+            detected
+        } else {
+            warn!(
+                target: "akagi::bridge::majsoul",
+                "fetchGameRecord {uuid}: unexpected seat count {detected}; defaulting num_players=4"
+            );
+            4
+        };
+
+        self.game_uuid = Some(uuid.to_string());
+        self.game_id = Some(stable_game_id(uuid));
+        self.seat = Some(our_seat);
+        self.num_players = num_players;
+
+        let meta_u32 = |key: &str| {
+            head.pointer(&format!("/config/meta/{key}"))
+                .and_then(JsonValue::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|&value| value != 0)
+        };
+        let mode_id = meta_u32("mode_id");
+        let room_id = meta_u32("room_id");
+        let contest_uid = meta_u32("contest_uid");
+        let match_mode = head
+            .pointer("/config/mode/mode")
+            .and_then(JsonValue::as_u64)
+            .and_then(|value| u8::try_from(value).ok());
+        let names = names_from_accounts(&accounts, num_players);
+
+        info!(
+            target: "akagi::bridge::majsoul",
+            "importing paipu {uuid}: our_seat={our_seat} num_players={num_players} \
+             mode_id={mode_id:?} match_mode={match_mode:?} names={names:?} \
+             ({} records to replay)",
+            record_blobs.len(),
+        );
+
+        let mut events = vec![MjaiEvent::StartGame {
+            names,
+            kyoku_first: None,
+            aka_flag: None,
+            id: Some(our_seat),
+            num_players,
+            game_meta: Some(GameMeta {
+                game_id: self.game_id,
+                match_mode,
+                match_info: Some(MatchInfo::Majsoul {
+                    game_uuid: self.game_uuid.clone(),
+                    mode_id,
+                    room_id,
+                    contest_uid,
+                }),
+            }),
+        }];
+
+        // Same hygiene as `handle_game_restore`: never let replayed data
+        // touch the live autoplay budget slot, and never let a stale
+        // pending riichi from unrelated prior traffic on this flow leak a
+        // spurious `reach_accepted` in front of the first replayed event.
+        self.replaying = true;
+        self.restore_budget = None;
+        self.pending_reach_accepted = None;
+
+        for blob in record_blobs {
+            let (record_name, record_json) = match parser::decode_paipu_wrapper(blob) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        target: "akagi::bridge::majsoul",
+                        "fetchGameRecord {uuid}: failed to decode record: {e:#}"
+                    );
+                    continue;
+                }
+            };
+            let Some((action_name, action_data)) =
+                record_to_action(&record_name, record_json, our_seat)
+            else {
+                // No live Action counterpart (e.g. non-gameplay bookkeeping
+                // records) — same as `handle_game_restore` silently
+                // skipping `ActionMJStart` and other unrecognised actions.
+                continue;
+            };
+            let synthetic = ParsedMessage {
+                msg_type: MessageType::Notify,
+                msg_id: None,
+                method_name: Arc::from(METHOD_ACTION_PROTOTYPE),
+                payload: json!({ "name": action_name, "data": action_data }),
+            };
+            events.extend(self.handle_action_prototype(&synthetic));
+        }
+
+        self.replaying = false;
+        // Discard, don't commit: a browsed replay must never open a
+        // decision window on the shared time-budget slot.
+        self.restore_budget = None;
+
+        let (final_scores, final_ranks) = parse_game_end_standings(head, num_players)
+            .map(|(scores, ranks)| (Some(scores), Some(ranks)))
+            .unwrap_or((None, None));
+        events.push(MjaiEvent::confirmed_game(final_scores, final_ranks));
         events
     }
 
@@ -1450,6 +1738,156 @@ fn names_from_payload(payload: &JsonValue, seat_list: &[JsonValue]) -> Vec<Strin
                 .unwrap_or_default()
         })
         .collect()
+}
+
+/// Resolve seat → nickname from a paipu's `head.accounts[]` (one combined
+/// list carrying `account_id` + `seat` + `nickname` per entry — unlike the
+/// live `authGame` response's separate `seat_list`/`players`). Robot seats
+/// live in `head.robots`, which never appears here, so they naturally end
+/// up with an empty name — same convention as `names_from_payload`.
+fn names_from_accounts(accounts: &[JsonValue], num_players: u8) -> Vec<String> {
+    let mut names = vec![String::new(); num_players as usize];
+    for acc in accounts {
+        if let (Some(seat), Some(nick)) = (
+            acc.get("seat").and_then(JsonValue::as_u64),
+            acc.get("nickname").and_then(JsonValue::as_str),
+        ) {
+            if let Some(slot) = names.get_mut(seat as usize) {
+                *slot = nick.to_string();
+            }
+        }
+    }
+    names
+}
+
+/// Convert one decoded `.lq.RecordXxx` payload (paipu / full-information
+/// shape) into its `.lq.ActionXxx` counterpart (live shape), redacted to
+/// `our_seat`. `RecordXxx` and `ActionXxx` share almost every field name
+/// (different field numbers, decoded to JSON by name) — swapping the prefix
+/// and stripping the handful of fields that differ is what lets the
+/// existing live `build_*` conversions in `handle_action_prototype` run
+/// unchanged. Returns `None` for a record type with no live counterpart
+/// (non-gameplay bookkeeping records); the caller skips those, same as
+/// `handle_game_restore` skips `ActionMJStart`.
+///
+/// Redaction applied here (a paipu is a neutral, full-information record —
+/// every seat's starting hand and every draw; a live stream is never that):
+/// - `RecordNewRound`: keep only `tiles{our_seat}` (renamed to `tiles`, the
+///   field name `ActionNewRound` uses for the POV player's hand); drop
+///   `tiles0`..`tiles3` (the other three seats' starting hands), plus
+///   `seat`, `paishan` (dead-wall order) and `salt`, none of which
+///   `ActionNewRound` carries.
+/// - `RecordDealTile`: drop `tile` whenever `seat != our_seat` — a paipu
+///   records every draw; live only ever tells a client its own (see
+///   `build_tsumo`, which already treats a missing/empty `tile` here as
+///   `"?"`).
+/// - `RecordDiscardTile`: drop `tingpais` whenever `seat != our_seat` —
+///   confirmed by inspecting a real capture, this is the *discarder's own*
+///   post-discard tenpai/wait analysis (per-wait fu/han), i.e. a summary of
+///   their hand shape. Real play never surfaces another seat's tenpai
+///   analysis on an ordinary discard (only at `RecordNoTile`/ryukyoku,
+///   where a tenpai declaration becomes public by the rules of the game —
+///   see below).
+/// - `RecordNewRound`: also drop `tingpai` (`RecordNewRound.TingPai`, a
+///   per-seat list) for the same reason — `ActionNewRound` has no
+///   equivalent field at all, and nobody is tenpai at deal-in anyway, but
+///   better safe than relying on it always being empty.
+/// - Every record type: an `operation`/`operations` field
+///   (`OptionalOperationList`) carries `combination` — the exact tiles in
+///   *that seat's* hand that make a call legal. Confirmed by inspecting a
+///   real capture: a paipu populates this for every seat with an open
+///   decision window (chi/pon/kan/riichi candidates, full tile detail);
+///   live only ever addresses our own. Any entry not addressed to
+///   `our_seat` is dropped.
+///
+/// Deliberately **not** redacted: `RecordNoTile.players[].hand`/`tings`
+/// (`ActionNoTile` has the identical field, and a real capture confirms
+/// Majsoul already zeroes `hand`/`tings` for noten seats server-side —
+/// only tenpai hands are non-empty, which is public information at
+/// exhaustive draw by the rules of the game, not a paipu-specific leak).
+/// `RecordHule.hules[].hand` likewise — a hora legitimately reveals the
+/// winning hand to everyone, live or replayed.
+fn record_to_action(
+    record_name: &str,
+    mut data: JsonValue,
+    our_seat: Actor,
+) -> Option<(&'static str, JsonValue)> {
+    let bare = record_name.rsplit('.').next().unwrap_or(record_name);
+    let action_name: &'static str = match bare {
+        "RecordNewRound" => "ActionNewRound",
+        "RecordDealTile" => "ActionDealTile",
+        "RecordDiscardTile" => "ActionDiscardTile",
+        "RecordChiPengGang" => "ActionChiPengGang",
+        "RecordAnGangAddGang" => "ActionAnGangAddGang",
+        "RecordHule" => "ActionHule",
+        "RecordNoTile" => "ActionNoTile",
+        "RecordLiuJu" => "ActionLiuJu",
+        "RecordBaBei" => "ActionBaBei",
+        _ => return None,
+    };
+
+    let Some(obj) = data.as_object_mut() else {
+        return None;
+    };
+
+    if bare == "RecordNewRound" {
+        let our_tiles = obj
+            .remove(&format!("tiles{our_seat}"))
+            .unwrap_or_else(|| JsonValue::Array(Vec::new()));
+        for seat in 0..4u8 {
+            obj.remove(&format!("tiles{seat}"));
+        }
+        obj.insert("tiles".to_string(), our_tiles);
+        obj.remove("seat");
+        obj.remove("paishan");
+        obj.remove("salt");
+        obj.remove("tingpai");
+    }
+
+    if bare == "RecordDealTile" {
+        let seat = obj.get("seat").and_then(JsonValue::as_u64).unwrap_or(0);
+        if seat != u64::from(our_seat) {
+            obj.remove("tile");
+        }
+    }
+
+    if bare == "RecordDiscardTile" {
+        let seat = obj.get("seat").and_then(JsonValue::as_u64).unwrap_or(0);
+        if seat != u64::from(our_seat) {
+            obj.remove("tingpais");
+        }
+    }
+
+    redact_operations(obj, our_seat);
+
+    Some((action_name, data))
+}
+
+/// Drop an `operation`/`operations` (`OptionalOperationList`) entry whose
+/// `seat` isn't `our_seat` — see `record_to_action`'s doc comment. Also
+/// folds the plural `operations` (used by some `RecordXxx` messages where
+/// the live `ActionXxx` counterpart has only the singular `operation`) down
+/// to a single value so callers can look up `operation` either way; no
+/// `build_*` conversion currently reads either field, so this is
+/// belt-and-braces against a future one that does.
+fn redact_operations(obj: &mut serde_json::Map<String, JsonValue>, our_seat: Actor) {
+    if let Some(JsonValue::Array(list)) = obj.remove("operations") {
+        let keep = list
+            .into_iter()
+            .find(|op| is_our_operation(op, our_seat))
+            .unwrap_or(JsonValue::Null);
+        obj.insert("operation".to_string(), keep);
+        return;
+    }
+    if let Some(op) = obj.get("operation") {
+        if !op.is_null() && !is_our_operation(op, our_seat) {
+            obj.insert("operation".to_string(), JsonValue::Null);
+        }
+    }
+}
+
+fn is_our_operation(op: &JsonValue, our_seat: Actor) -> bool {
+    op.get("seat").and_then(JsonValue::as_u64) == Some(u64::from(our_seat))
 }
 
 /// `inputOperation` op types autoplay needs to tell apart. Anything else
@@ -4402,5 +4840,265 @@ mod tests {
             payload: json!({ "result": {} }),
         });
         assert!(slot.read().unwrap().is_none());
+    }
+
+    /// Shared setup for the paipu tests below: read the fixture path from
+    /// `AKAGI_PAIPU_FIXTURE` (never committed — contains real personal
+    /// data), or `None` to skip cleanly.
+    fn load_paipu_fixture() -> Option<JsonValue> {
+        let fixture_path = std::env::var("AKAGI_PAIPU_FIXTURE").ok()?;
+        let raw = std::fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|e| panic!("failed to read {fixture_path}: {e:#}"));
+        Some(serde_json::from_str(&raw).expect("fixture is not valid JSON"))
+    }
+
+    /// The core information-hiding + shape assertions, shared by every
+    /// paipu-import test so both a POV of seat 0 and a POV of a different
+    /// seat exercise the same checks (seat 0 alone can't distinguish
+    /// "resolved via account_id" from "fell back to 0").
+    fn assert_pov_redacted_stream(events: &[MjaiEvent], pov: Actor) {
+        assert!(!events.is_empty(), "paipu import produced no events");
+
+        // Starts with start_game for the resolved seat...
+        match &events[0] {
+            MjaiEvent::StartGame {
+                id, num_players, ..
+            } => {
+                assert_eq!(*id, Some(pov), "expected POV seat {pov}");
+                assert_eq!(*num_players, 4, "expected a 4p hanchan");
+            }
+            other => panic!("expected start_game first, got {other:?}"),
+        }
+        // ...and ends with exactly one end_game.
+        assert!(
+            matches!(events.last(), Some(MjaiEvent::EndGame { .. })),
+            "expected end_game last, got {:?}",
+            events.last()
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, MjaiEvent::EndGame { .. }))
+                .count(),
+            1,
+            "expected exactly one end_game"
+        );
+
+        let tsumo_count = events
+            .iter()
+            .filter(|e| matches!(e, MjaiEvent::Tsumo { .. }))
+            .count();
+        let dahai_count = events
+            .iter()
+            .filter(|e| matches!(e, MjaiEvent::Dahai { .. }))
+            .count();
+        assert!(
+            tsumo_count > 100,
+            "too few tsumo for a hanchan: {tsumo_count}"
+        );
+        assert!(
+            dahai_count > 100,
+            "too few dahai for a hanchan: {dahai_count}"
+        );
+
+        // The core information-hiding check: nobody but `pov` ever gets a
+        // concrete tile on their draw.
+        for ev in events {
+            if let MjaiEvent::Tsumo { actor, pai } = ev {
+                if *actor != pov {
+                    assert_eq!(
+                        pai, "?",
+                        "actor {actor} tsumo leaked a concrete tile: {pai}"
+                    );
+                }
+            }
+        }
+
+        // Same leak vector at the source: every start_kyoku's tehai for
+        // seats other than `pov` must be all-unknown, and `pov`'s own must
+        // be fully concrete.
+        let start_kyoku_count = events
+            .iter()
+            .filter(|e| matches!(e, MjaiEvent::StartKyoku { .. }))
+            .count();
+        for ev in events {
+            if let MjaiEvent::StartKyoku { tehais, .. } = ev {
+                for (seat, hand) in tehais.iter().enumerate() {
+                    if seat as Actor != pov {
+                        assert!(
+                            hand.iter().all(|t| t == "?"),
+                            "seat {seat} start_kyoku tehai leaked: {hand:?}"
+                        );
+                    } else {
+                        assert!(
+                            hand.iter().all(|t| t != "?"),
+                            "our own seat {pov} tehai is missing tiles: {hand:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // Sane round count for a hanchan (E1..E4/S1..S4 baseline is 8
+        // kyoku; bounded loosely above for honba/renchan repeats).
+        assert!(
+            (4..=40).contains(&start_kyoku_count),
+            "implausible kyoku count for a hanchan: {start_kyoku_count}"
+        );
+
+        let end_kyoku_count = events
+            .iter()
+            .filter(|e| matches!(e, MjaiEvent::EndKyoku))
+            .count();
+        assert_eq!(
+            start_kyoku_count, end_kyoku_count,
+            "start_kyoku / end_kyoku count mismatch"
+        );
+
+        // Every end_kyoku is immediately preceded by a hora (one or more,
+        // multi-ron) or a ryukyoku — never a bare close.
+        let hora_count = events
+            .iter()
+            .filter(|e| matches!(e, MjaiEvent::Hora { .. }))
+            .count();
+        let ryukyoku_count = events
+            .iter()
+            .filter(|e| matches!(e, MjaiEvent::Ryukyoku { .. }))
+            .count();
+        for (idx, ev) in events.iter().enumerate() {
+            if matches!(ev, MjaiEvent::EndKyoku) {
+                let prev = idx.checked_sub(1).map(|i| &events[i]);
+                assert!(
+                    matches!(
+                        prev,
+                        Some(MjaiEvent::Hora { .. }) | Some(MjaiEvent::Ryukyoku { .. })
+                    ),
+                    "end_kyoku at index {idx} not preceded by hora/ryukyoku: {prev:?}"
+                );
+            }
+        }
+        assert!(hora_count + ryukyoku_count >= start_kyoku_count);
+
+        eprintln!(
+            "paipu import (pov={pov}): {} events, {start_kyoku_count} kyoku, {hora_count} hora, \
+             {ryukyoku_count} ryukyoku, {tsumo_count} tsumo, {dahai_count} dahai",
+            events.len(),
+        );
+    }
+
+    /// End-to-end paipu import against a real captured
+    /// `.lq.Lobby.fetchGameRecord` response, from the actual account's own
+    /// point of view (seat resolved via a preceding `oauth2Login`, exactly
+    /// as it would happen in a real session). Contains real personal data
+    /// (account ids, nicknames), so it is never committed to the repo —
+    /// only read from a path given via `AKAGI_PAIPU_FIXTURE`, and `#[ignore]`d
+    /// so `cargo test` stays green (and CI, which never sets the var) never
+    /// touches it. Run locally with:
+    /// `AKAGI_PAIPU_FIXTURE=/path/to/paipu.json cargo test -p akagi --lib \
+    ///   bridge::majsoul::tests::paipu_import -- --ignored --nocapture`
+    ///
+    /// Optionally set `AKAGI_PAIPU_DUMP=/path/to/out.jsonl` to also write the
+    /// converted stream out, e.g. for a manual `validate_logs` run.
+    #[test]
+    #[ignore = "reads a local fixture with real personal data; set AKAGI_PAIPU_FIXTURE to run"]
+    fn paipu_import_resolves_our_own_seat_and_redacts_the_rest() {
+        let Some(payload) = load_paipu_fixture() else {
+            eprintln!("AKAGI_PAIPU_FIXTURE not set; skipping");
+            return;
+        };
+        let accounts = payload["head"]["accounts"].as_array().cloned().unwrap();
+        let our_account = accounts
+            .iter()
+            .find(|a| a["seat"].as_u64() == Some(0))
+            .expect("fixture has a seat-0 account");
+        let account_id = our_account["account_id"].as_u64().unwrap();
+        let nickname = our_account["nickname"].as_str().unwrap().to_string();
+
+        let mut bridge = MajsoulBridge::new(None, None);
+        // Capture our own account_id the way a real session would: from the
+        // oauth2Login response, before the paipu is ever opened.
+        bridge.dispatch(&resp(
+            METHOD_OAUTH2_LOGIN,
+            json!({ "account_id": account_id }),
+        ));
+        let events = bridge.dispatch(&resp(METHOD_FETCH_GAME_RECORD, payload));
+
+        assert_pov_redacted_stream(&events, 0);
+        match &events[0] {
+            MjaiEvent::StartGame { names, .. } => {
+                assert_eq!(names[0], nickname, "our own seat's name should resolve");
+            }
+            _ => unreachable!(),
+        }
+
+        if let Ok(dump_path) = std::env::var("AKAGI_PAIPU_DUMP") {
+            let mut out = String::new();
+            for ev in &events {
+                out.push_str(&serde_json::to_string(ev).expect("serialize MjaiEvent"));
+                out.push('\n');
+            }
+            std::fs::write(&dump_path, out)
+                .unwrap_or_else(|e| panic!("failed to write dump to {dump_path}: {e:#}"));
+            eprintln!("dumped converted stream to {dump_path}");
+        }
+    }
+
+    /// Same fixture, but resolved from a *different* account's point of
+    /// view — proves seat resolution actually reads `account_id` /
+    /// `head.accounts[].seat` rather than coincidentally landing on the
+    /// fallback (fixture POV and the no-match fallback are both seat 0, so
+    /// the test above alone can't tell resolution from fallback). Also
+    /// exercises the `tiles2 → tiles` rename that the seat-0 run never
+    /// touches.
+    #[test]
+    #[ignore = "reads a local fixture with real personal data; set AKAGI_PAIPU_FIXTURE to run"]
+    fn paipu_import_resolves_a_different_seat_from_account_id() {
+        let Some(payload) = load_paipu_fixture() else {
+            eprintln!("AKAGI_PAIPU_FIXTURE not set; skipping");
+            return;
+        };
+        let accounts = payload["head"]["accounts"].as_array().cloned().unwrap();
+        let other_account = accounts
+            .iter()
+            .find(|a| a["seat"].as_u64() == Some(2))
+            .expect("fixture has a seat-2 account");
+        let account_id = other_account["account_id"].as_u64().unwrap();
+        let nickname = other_account["nickname"].as_str().unwrap().to_string();
+
+        let mut bridge = MajsoulBridge::new(None, None);
+        bridge.dispatch(&resp(
+            METHOD_OAUTH2_LOGIN,
+            json!({ "account_id": account_id }),
+        ));
+        let events = bridge.dispatch(&resp(METHOD_FETCH_GAME_RECORD, payload));
+
+        assert_pov_redacted_stream(&events, 2);
+        match &events[0] {
+            MjaiEvent::StartGame { names, .. } => {
+                assert_eq!(names[2], nickname, "seat 2's own name should resolve");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// No `oauth2Login` was ever observed on this flow (e.g. a session that
+    /// started mid-way, or a spectated/foreign game). Per spec: fall back
+    /// to seat 0 rather than failing outright. This only proves the
+    /// fallback value and that it doesn't panic — `
+    /// paipu_import_resolves_a_different_seat_from_account_id` above is
+    /// what proves real resolution isn't just this same fallback in
+    /// disguise.
+    #[test]
+    #[ignore = "reads a local fixture with real personal data; set AKAGI_PAIPU_FIXTURE to run"]
+    fn paipu_import_without_login_falls_back_to_seat_0() {
+        let Some(payload) = load_paipu_fixture() else {
+            eprintln!("AKAGI_PAIPU_FIXTURE not set; skipping");
+            return;
+        };
+        let mut bridge = MajsoulBridge::new(None, None);
+        let events = bridge.dispatch(&resp(METHOD_FETCH_GAME_RECORD, payload));
+        match &events[0] {
+            MjaiEvent::StartGame { id, .. } => assert_eq!(*id, Some(0)),
+            other => panic!("expected start_game first, got {other:?}"),
+        }
     }
 }
