@@ -2,15 +2,18 @@
 // to open the detail dialog. Delete button on each row asks for
 // confirmation before invoking the backend command.
 //
-// Review integration (Beta): rather than a new column — the table is
-// already at capacity — the review affordance shares the trailing actions
-// cell with delete, as one status-driven icon: not reviewed → submit flow
-// (the Review page's confirm dialog, pre-selected to this game), reviewed →
-// open the result, link revoked → re-issue, reviewing → spinner. Rows the
-// feature can't apply to (no API key, observer games) show no icon at all.
+// Review integration: rather than a new column — the table is already at
+// capacity — the review affordance shares the trailing actions cell with
+// delete, as one status-driven icon. This runs the LOCAL review tool
+// (`review_game_locally`, no API key needed) rather than the paid cloud
+// service: not reviewed → run it and open the report, reviewed → reopen
+// the cached report, reviewing → spinner. Observer games (no recorded
+// seat) show no icon — the local tool can't auto-detect a seat for them.
+// The cloud submit flow (`ReviewSubmitDialog`) still exists, reachable
+// from `GameDetailDialog`'s own review section for users who do have a key.
 
 import { useEffect, useState } from 'react'
-import { Loader2, SearchCheck, Share2, Trash2 } from 'lucide-react'
+import { Loader2, SearchCheck, Trash2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -25,19 +28,18 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import {
-  computeGameReviewStatus,
+  computeLocalReviewStatus,
   useReviewStatusDeps,
 } from '@/components/review/gameReviewStatus'
 import { ReviewSubmitDialog } from '@/components/review/ReviewSubmitDialog'
 import { useKeyStatus } from '@/hooks/useKeyStatus'
 import { invoke } from '@/lib/tauri'
-import { openExternal } from '@/lib/external'
 import { roomLabelKey } from '@/lib/matchInfo'
 import { computePt, type PtRule } from '@/lib/ptCalc'
 import { useConfigStore } from '@/stores/configStore'
 import { useHistoryStore } from '@/stores/historyStore'
 import { useReviewStore } from '@/stores/reviewStore'
-import type { GameRecord, ShareEntry } from '@/types'
+import type { GameRecord } from '@/types'
 
 import { GameDetailDialog } from './GameDetailDialog'
 
@@ -62,12 +64,29 @@ export function GameList({
   const { t } = useTranslation()
   const [open, setOpen] = useState<GameRecord | null>(null)
   const [reviewRec, setReviewRec] = useState<GameRecord | null>(null)
+  // Busy row + generated-report-path cache for the LOCAL review button
+  // (component state, not a store — the path is cheap to recompute and
+  // `review_game_locally` itself is the cache: a second call for an
+  // already-reviewed id just returns the existing file instantly).
   const [rowBusy, setRowBusy] = useState<string | null>(null)
+  const [reviewPaths, setReviewPaths] = useState<Record<string, string>>({})
   const remove = useHistoryStore((s) => s.remove)
 
+  // Reports generated in a past session should show "open review" right
+  // away, not only after the row is clicked once — `review_game_locally`
+  // already treats an existing file as a cache hit, this just surfaces
+  // that on mount. Best-effort: an error here just means rows fall back
+  // to "review this game" until clicked, same as a fresh install.
+  useEffect(() => {
+    invoke<Record<string, string>>('list_local_reviews')
+      .then(setReviewPaths)
+      .catch(() => {})
+  }, [])
+
+  // Still needed for `GameDetailDialog`'s cloud review section (untouched,
+  // out of scope) — its "already reviewed" status only resolves once the
+  // share list has loaded, which the effect below kicks off.
   const reviewDeps = useReviewStatusDeps()
-  const resolveShareUrl = useReviewStore((s) => s.resolveShareUrl)
-  const reshare = useReviewStore((s) => s.reshare)
 
   const config = useConfigStore((s) => s.config)
   const api = config?.bot.api
@@ -98,22 +117,32 @@ export function GameList({
     }
   }
 
-  const onOpenShare = async (rowId: string, share: ShareEntry) => {
-    setRowBusy(rowId)
-    const url = await resolveShareUrl(share)
-    setRowBusy(null)
-    if (url) openExternal(url)
+  const openLocalReview = async (path: string) => {
+    try {
+      await invoke('open_review_report', { path })
+    } catch (e) {
+      toast.error(String(e))
+    }
   }
 
-  const onReshare = async (rowId: string) => {
-    setRowBusy(rowId)
-    const url = await reshare(rowId)
-    setRowBusy(null)
-    if (url) openExternal(url)
+  const onReviewLocally = async (r: GameRecord) => {
+    setRowBusy(r.id)
+    try {
+      const path = await invoke<string>('review_game_locally', { id: r.id })
+      setReviewPaths((m) => ({ ...m, [r.id]: path }))
+      await openLocalReview(path)
+    } catch (e) {
+      toast.error(String(e), { duration: 10_000 })
+    } finally {
+      setRowBusy(null)
+    }
   }
 
   const reviewSlot = (r: GameRecord) => {
-    const status = computeGameReviewStatus(r, reviewDeps)
+    const status = computeLocalReviewStatus(r, {
+      busy: rowBusy === r.id,
+      path: reviewPaths[r.id] ?? null,
+    })
     switch (status.kind) {
       case 'hidden':
         return null
@@ -126,7 +155,7 @@ export function GameList({
             title={t('review.review_this_game')}
             onClick={(e) => {
               e.stopPropagation()
-              setReviewRec(r)
+              void onReviewLocally(r)
             }}
           >
             <SearchCheck className="h-4 w-4 text-muted-foreground" />
@@ -145,36 +174,18 @@ export function GameList({
           </Button>
         )
       case 'reviewed':
-      case 'reviewed_loading':
         return (
           <Button
             variant="ghost"
             size="sm"
-            disabled={status.kind === 'reviewed_loading' || rowBusy === r.id}
             aria-label={t('review.open_review')}
             title={t('review.open_review')}
             onClick={(e) => {
               e.stopPropagation()
-              if (status.kind === 'reviewed') void onOpenShare(r.id, status.share)
+              void openLocalReview(status.path)
             }}
           >
             <SearchCheck className="h-4 w-4 text-emerald-500" />
-          </Button>
-        )
-      case 'revoked':
-        return (
-          <Button
-            variant="ghost"
-            size="sm"
-            disabled={rowBusy === r.id}
-            aria-label={t('review.reshare')}
-            title={t('review.reshare')}
-            onClick={(e) => {
-              e.stopPropagation()
-              void onReshare(r.id)
-            }}
-          >
-            <Share2 className="h-4 w-4 text-muted-foreground" />
           </Button>
         )
     }

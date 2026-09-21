@@ -1332,6 +1332,202 @@ pub async fn delete_game_history_entry(id: String, state: State<'_, AppState>) -
     Ok(removed)
 }
 
+/// Run the bundled local review tool (`<bot_dir>/review.py`) against a
+/// recorded game's `.mjai.jsonl` and return the absolute path to the
+/// generated HTML report. Reviews are deterministic for a given log +
+/// model, so a second call for the same `id` is a no-op that just hands
+/// back the already-written path instead of re-running the ~3s replay.
+///
+/// Requires the active 4-player bot (`config.bot.active_4p`) to ship a
+/// `review.py` and have an installed Python environment (the managed
+/// `.akagi/venv`, falling back to a dev `.venv`).
+#[tauri::command]
+pub async fn review_game_locally(id: String, state: State<'_, AppState>) -> CmdResult<String> {
+    let store = state.history_store.clone();
+    let id_for_blocking = id.clone();
+    let record = tokio::task::spawn_blocking(move || store.get(&id_for_blocking))
+        .await
+        .map_err(|e| format!("history get join error: {e}"))?
+        .map_err(|e| format!("{e:#}"))?
+        .ok_or_else(|| format!("game {id:?} not found"))?;
+
+    // Reconstructed rather than exposed by `HistoryStore`: no public
+    // accessor returns the per-game log path (only `get_events`, which
+    // parses it). Built from `record.id` (not the raw request `id`) so
+    // this only ever touches a path that matched a real index entry.
+    let log_path = state
+        .history_store
+        .root()
+        .join("games")
+        .join(format!("{}.mjai.jsonl", record.id));
+    if !log_path.is_file() {
+        return Err(format!(
+            "recorded log missing for game {:?} (expected {})",
+            record.id,
+            log_path.display()
+        ));
+    }
+
+    let (bot_dir_cfg, active_4p) = {
+        let cfg = state.config.read().await;
+        (cfg.bot.dir.clone(), cfg.bot.active_4p.clone())
+    };
+    if active_4p.is_empty() {
+        return Err("no active 4-player bot is configured".to_string());
+    }
+    let bot_dir = resolve_dir(Path::new(&bot_dir_cfg)).join(&active_4p);
+    if !bot_dir.is_dir() {
+        return Err(format!(
+            "bot {active_4p:?} not found at {}",
+            bot_dir.display()
+        ));
+    }
+
+    let script = bot_dir.join("review.py");
+    if !script.is_file() {
+        return Err(format!(
+            "bot {active_4p:?} does not support local review (no review.py)"
+        ));
+    }
+
+    let managed = runtime::venv_python(&bot_dir.join(".akagi").join("venv"));
+    let fallback = runtime::venv_python(&bot_dir.join(".venv"));
+    let python = if managed.is_file() {
+        managed
+    } else if fallback.is_file() {
+        fallback
+    } else {
+        return Err(format!(
+            "bot {active_4p:?} has no installed Python environment — install it from the Bots tab first"
+        ));
+    };
+
+    let reviews_dir = state.history_store.root().join("reviews");
+    std::fs::create_dir_all(&reviews_dir)
+        .map_err(|e| format!("create {}: {e}", reviews_dir.display()))?;
+    let out_path = reviews_dir.join(format!("{}.html", record.id));
+
+    let title = format!(
+        "{:?} {}",
+        record.platform,
+        record
+            .started_at
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M"),
+    );
+
+    let result = run_local_review(&python, &script, &bot_dir, &log_path, &out_path, &title).await?;
+    Ok(result.to_string_lossy().into_owned())
+}
+
+/// Core of `review_game_locally`, split out so it's testable without a
+/// full `AppState`/`State` (see `review_locally_runs_and_skips_when_cached`
+/// below): given fully-resolved paths, run `review.py` and return the
+/// report path, or skip straight to it when `out_path` already exists —
+/// reviews are deterministic for a given log + model, so a cached report
+/// is never stale enough to warrant the ~3s rerun.
+async fn run_local_review(
+    python: &Path,
+    script: &Path,
+    bot_dir: &Path,
+    log_path: &Path,
+    out_path: &Path,
+    title: &str,
+) -> CmdResult<PathBuf> {
+    if out_path.is_file() {
+        return Ok(out_path.to_path_buf());
+    }
+
+    let mut cmd = tokio::process::Command::new(python);
+    cmd.current_dir(bot_dir)
+        .arg(script)
+        .arg(log_path)
+        .arg("--out")
+        .arg(out_path)
+        .arg("--title")
+        .arg(title)
+        .kill_on_drop(true);
+    runtime::scrub_python_env(&mut cmd);
+
+    let output = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output())
+        .await
+        .map_err(|_| "review.py timed out after 60s".to_string())?
+        .map_err(|e| format!("spawn review.py: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail: Vec<&str> = stderr.lines().rev().take(20).collect();
+        let tail: String = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+        return Err(format!(
+            "review.py exited with {}: {}",
+            output.status,
+            if tail.is_empty() {
+                "(no stderr)"
+            } else {
+                &tail
+            }
+        ));
+    }
+
+    Ok(out_path.to_path_buf())
+}
+
+/// List already-generated local review reports as `{ id: absolute path }`.
+/// The frontend calls this once on the History tab mounting so a game
+/// reviewed in a past session shows the "open review" icon immediately
+/// instead of only after the next click (`review_game_locally` itself
+/// already treats an existing file as a cache hit — this just surfaces
+/// that cache to the UI without a round trip per row).
+#[tauri::command]
+pub async fn list_local_reviews(state: State<'_, AppState>) -> CmdResult<BTreeMap<String, String>> {
+    let reviews_dir = state.history_store.root().join("reviews");
+    tokio::task::spawn_blocking(move || -> CmdResult<BTreeMap<String, String>> {
+        let mut out = BTreeMap::new();
+        let entries = match std::fs::read_dir(&reviews_dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(format!("read_dir {}: {e}", reviews_dir.display())),
+        };
+        for entry in entries {
+            let path = entry
+                .map_err(|e| format!("read_dir entry in {}: {e}", reviews_dir.display()))?
+                .path();
+            if path.extension().and_then(|e| e.to_str()) != Some("html") {
+                continue;
+            }
+            if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
+                out.insert(id.to_string(), path.to_string_lossy().into_owned());
+            }
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| format!("list_local_reviews join error: {e}"))?
+}
+
+/// Open a previously generated local review report (see
+/// `review_game_locally`) in the OS's default handler for `.html` files.
+/// The path is frontend-supplied (cached from `review_game_locally`'s
+/// return value); `open_external_url` deliberately refuses anything but
+/// `http(s)://`, so this is the narrow local-file equivalent, restricted
+/// to `<history_root>/reviews/*.html` (defense-in-depth, matching
+/// `delete_bot`'s escape guard).
+#[tauri::command]
+pub async fn open_review_report(path: String, state: State<'_, AppState>) -> CmdResult<()> {
+    let reviews_dir = state.history_store.root().join("reviews");
+    let canon_reviews = std::fs::canonicalize(&reviews_dir)
+        .map_err(|e| format!("canonicalize {}: {e}", reviews_dir.display()))?;
+    let canon_target =
+        std::fs::canonicalize(&path).map_err(|e| format!("canonicalize {path}: {e}"))?;
+    let is_html = canon_target.extension().and_then(|e| e.to_str()) == Some("html");
+    if !canon_target.starts_with(&canon_reviews) || !is_html {
+        return Err(format!(
+            "refused to open {path:?}: not a local review report"
+        ));
+    }
+    open_path(&canon_target)
+}
+
 /// `shinkuan/Akagi` is the canonical upstream — kept here as a const
 /// instead of plumbing through config so the user can't accidentally
 /// point the auto-updater at a fork.
@@ -1780,6 +1976,9 @@ macro_rules! ipc_handlers {
             $crate::ipc::commands::get_game_history_record,
             $crate::ipc::commands::get_game_history_events,
             $crate::ipc::commands::delete_game_history_entry,
+            $crate::ipc::commands::review_game_locally,
+            $crate::ipc::commands::list_local_reviews,
+            $crate::ipc::commands::open_review_report,
             $crate::ipc::commands::check_for_update,
             $crate::ipc::commands::apply_update,
             $crate::ipc::commands::native_api_redeem,
@@ -1824,6 +2023,88 @@ mod tests {
                 "{url} must be refused"
             );
         }
+    }
+
+    /// End-to-end proof that `run_local_review` actually drives
+    /// `review.py` against a real recorded game, and that the
+    /// "already exists" branch is a true skip (no rerun) rather than an
+    /// accidental re-generate. Exercises the exact interpreter-resolution
+    /// shape `review_game_locally` uses (`bot::runtime::venv_python`
+    /// against a `.venv`) pointed at fixed paths instead of config —
+    /// building a full `AppState` here isn't worth it for a
+    /// path-resolution + subprocess check.
+    ///
+    /// `#[ignore]`d and env-driven: needs a real bot venv and a recorded
+    /// mjai log, which CI has neither of. Run locally with
+    /// `AKAGI_REVIEW_BOT_DIR=<bot dir> AKAGI_REVIEW_LOG=<game.mjai.jsonl> \
+    ///   cargo test --lib review_locally_runs_and_skips_when_cached -- --ignored`.
+    /// Paths come from the environment so no machine-local path is committed.
+    #[tokio::test]
+    #[ignore]
+    async fn review_locally_runs_and_skips_when_cached() {
+        let (Ok(bot_dir), Ok(log)) = (
+            std::env::var("AKAGI_REVIEW_BOT_DIR"),
+            std::env::var("AKAGI_REVIEW_LOG"),
+        ) else {
+            eprintln!("AKAGI_REVIEW_BOT_DIR / AKAGI_REVIEW_LOG not set; skipping");
+            return;
+        };
+        let bot_dir = Path::new(&bot_dir);
+        let python = runtime::venv_python(&bot_dir.join(".venv"));
+        let script = bot_dir.join("review.py");
+        let log_path = Path::new(&log);
+        assert!(
+            python.is_file(),
+            "expected venv python at {}",
+            python.display()
+        );
+        assert!(
+            script.is_file(),
+            "expected review.py at {}",
+            script.display()
+        );
+        assert!(
+            log_path.is_file(),
+            "expected recorded log at {}",
+            log_path.display()
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let out_path = tmp.path().join("review.html");
+
+        let first = run_local_review(
+            &python,
+            &script,
+            bot_dir,
+            log_path,
+            &out_path,
+            "review test",
+        )
+        .await
+        .expect("first run should generate the report");
+        assert_eq!(first, out_path);
+        let html = std::fs::read_to_string(&out_path).unwrap();
+        assert!(
+            html.contains(r#"<script type="application/json""#),
+            "report should embed the payload script tag"
+        );
+
+        // Second call: point at bogus python/script paths. If the skip
+        // branch didn't actually skip, spawning either would error, and
+        // this would fail instead of returning the cached path.
+        let bogus_python = tmp.path().join("no-such-python");
+        let bogus_script = tmp.path().join("no-such-script.py");
+        let second = run_local_review(
+            &bogus_python,
+            &bogus_script,
+            bot_dir,
+            log_path,
+            &out_path,
+            "unused",
+        )
+        .await
+        .expect("cached report should be returned without rerunning");
+        assert_eq!(second, out_path);
     }
 
     #[test]

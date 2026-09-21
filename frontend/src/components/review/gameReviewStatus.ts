@@ -61,3 +61,36 @@ export function useGameReviewStatus(record: GameRecord | null): GameReviewStatus
   if (!record) return { kind: 'hidden' }
   return computeGameReviewStatus(record, deps)
 }
+
+// --- Local review (bypasses the cloud gating above) -----------------------
+//
+// The cloud states (`reviewed_loading` / `revoked` / a `share`) don't apply
+// to a report that's just a file on disk — there's nothing to revoke or
+// re-share. So rather than reworking `computeGameReviewStatus` (used by
+// `GameDetailDialog`'s cloud "Review" section too) into a shape that no
+// longer fits its own states, the local flow gets its own tiny pure
+// function: same `none -> reviewing -> reviewed` shape, driven by
+// component-local state (GameList's `rowBusy` + a per-row generated-path
+// cache) instead of the cloud store.
+
+export type LocalReviewStatus =
+  /** Observed game (no seat) or a 3p table — the local review.py is a
+   *  4p-only tool (fixed 46-bit action mask, 4p `libriichi.mjai.Bot`), so
+   *  neither case can run it. */
+  | { kind: 'hidden' }
+  /** Not reviewed yet. */
+  | { kind: 'none' }
+  /** `review_game_locally` is running for this row. */
+  | { kind: 'reviewing' }
+  /** Report already generated — open the cached path. */
+  | { kind: 'reviewed'; path: string }
+
+export function computeLocalReviewStatus(
+  record: GameRecord,
+  { busy, path }: { busy: boolean; path: string | null },
+): LocalReviewStatus {
+  if (record.our_seat == null || record.num_players !== 4) return { kind: 'hidden' }
+  if (busy) return { kind: 'reviewing' }
+  if (path) return { kind: 'reviewed', path }
+  return { kind: 'none' }
+}

@@ -205,7 +205,7 @@ impl PythonRuntime {
 /// (used both for `uv sync` and for the venv it seeds) is relocatable
 /// and resolves its stdlib via `sys._base_executable`, so removing
 /// these is strictly safer than inheriting them.
-fn scrub_python_env(cmd: &mut Command) {
+pub(crate) fn scrub_python_env(cmd: &mut Command) {
     cmd.env_remove("PYTHONHOME").env_remove("PYTHONPATH");
 }
 
